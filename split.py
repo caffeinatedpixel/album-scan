@@ -3,7 +3,7 @@
 import cv2, imutils
 import numpy as np
 import sys, math, logging
-from os.path import basename, splitext
+from os.path import basename, splitext, exists, isdir
 
 log = logging.getLogger()
 log.setLevel(logging.DEBUG)
@@ -14,6 +14,10 @@ ch.setFormatter(formatter)
 log.addHandler(ch)
 
 if len(sys.argv) == 1:
+  log.info("No output directory was specified");
+  sys.exit(0)
+
+if len(sys.argv) == 2:
   log.info("No files were specified as arguments");
   sys.exit(0)
 
@@ -25,6 +29,16 @@ cv2.moveWindow('image', 0, 0);
 
 thresh = 210
 blur = 5
+
+out_path = sys.argv[1]
+if not exists(out_path):
+  log.info("The specified output path does not exist: %s", out_path)
+  sys.exit(0)
+
+if not isdir(out_path):
+  log.info("The specified output path is not a directory: %s", out_path)
+  sys.exit(0)
+
 
 path = None
 canvas = None
@@ -42,6 +56,10 @@ auto_channel = 0
 points = []
 active_point = None
 rects = []
+
+editing_rect_idx = -1
+release_editing = False
+set_editing_points = False
 
 def load_image():
   img = cv2.imread(path)
@@ -112,7 +130,7 @@ def re_guess_rects():
 def guess_rects():
   log.info("guess_rects thresh=%d, blur=%d", thresh, blur)
   result = gen_thresh()
-  im2, contours, hierarchy = cv2.findContours(result, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+  contours, hierarchy = cv2.findContours(result, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
   for cnt in contours:
     area = cv2.contourArea(cnt)
     # sane-ish size
@@ -136,6 +154,7 @@ def put_line(img, line, text):
   cv2.putText(img, text, (0, y), cv2.FONT_HERSHEY_TRIPLEX, .7, (0,0,0), 1, cv2.FILLED)
 
 def render():
+  global set_editing_points
   if view_mode == 0:
     img = draw_canvas.copy()
   elif view_mode == 1:
@@ -148,7 +167,10 @@ def render():
     img = cv2.merge((t,t,t))
 
   for p in points:
-    cv2.circle(img, p, 6, color=(0,255,0), thickness=2, lineType=8, shift=0)
+    color = (0,255,0)
+    if editing_rect_idx > -1:
+      color = (240, 24, 38)
+    cv2.circle(img, p, 6, color=color, thickness=2, lineType=8, shift=0)
 
   put_line(img, 0, 'File %d/%d: %s' % (file_idx, len(sys.argv)-1, basename(path)))
   put_line(img, 1, 'Threshold: %d' % thresh)
@@ -158,26 +180,78 @@ def render():
 
   draw_rects = rects[:]
 
-  if active_point:
-    log.info("active_point %s", active_point)
-  if active_point:
-    cv2.circle(img, active_point, 6, color=(200,100,0), thickness=1, lineType=8, shift=0)
-    if len(points) == 3:
-      # use activepoint to draw a rect
-      pts = points[:] + [active_point]
-      draw_rects.append(cv2.minAreaRect(np.int0(pts)))
-
-  for r in draw_rects:
+  # recalculate bounding rect for the selected editing rect
+  if editing_rect_idx > -1:
+    newRect = cv2.minAreaRect(np.int0(points))
+    draw_rects[editing_rect_idx] = newRect
+    rects[editing_rect_idx] = newRect
+  else:
+    if active_point:
+      log.info("active_point %s", active_point)
+    if active_point:
+      cv2.circle(img, active_point, 6, color=(200,100,0), thickness=2, lineType=8, shift=0)
+      if len(points) == 3:
+        # use activepoint to draw a rect
+        pts = points[:] + [active_point]
+        draw_rects.append(cv2.minAreaRect(np.int0(pts)))
+      
+  for i, r in enumerate(draw_rects):
     box = cv2.boxPoints(r)
     box = np.int0(box)
-    cv2.drawContours(img, [box], 0, (100, 100, 255), 1)
+    color = (100, 100, 255)
+    if i == editing_rect_idx:
+      color = (56, 240, 24)
+    cv2.drawContours(img, [box], 0, color, 2)
   cv2.imshow('image', img)
   
 
+def reset_selected_rect():
+  # log.info('Resetting selected rect')
+  global editing_rect_idx
+  global release_editing
+  editing_rect_idx = -1
+  # clear points if they were previously rendered for a selected rect
+  if set_editing_points:
+    points.clear()
+  release_editing = True
+
 def canvas_click(event, x, y, flags, param):
   global active_point
+  global editing_rect_idx
+  global release_editing
+  global points
+  global set_editing_points
+  # select a rect to edit
+  if event == cv2.EVENT_MBUTTONDOWN:
+    log.info("Mousewheel-click: %d,%d", x, y)    
+    active_point = None
+    for i, r in enumerate(rects):
+      box = cv2.boxPoints(r)
+      box = np.int0(box)
+      test = cv2.pointPolygonTest(box,(x,y),True)
+      if test > -1:
+        log.info('Selected rect #%d', i)
+        set_editing_points = False
+        release_editing = False
+        editing_rect_idx = i
+        points.clear()
+          # if editing_rect_idx > -1 and not set_editing_points:
+        box = cv2.boxPoints(rects[editing_rect_idx])
+        box = np.int0(box)
+        for p in box:
+          points.append(p)
+        set_editing_points = True
+
+        render()
+        return
+    reset_selected_rect()
+    render()
+
+  # edit the points of a selected rect, 
+  # or adjust the position of the last point in a new rect while the 
+  # left mouse button is held down
   if event == cv2.EVENT_MOUSEMOVE and flags == 1:
-    log.info("Down: %d,%d flags=%s", x, y, flags)
+    log.info("Down: %d,%d flags=%s", x, y, flags)    
     if len(points) == 4:
       # replace existing point
       closest_idx = None
@@ -190,16 +264,22 @@ def canvas_click(event, x, y, flags, param):
           closest_idx = i
           closest_dist = dist
       log.info("Replace closest point at dist %f", closest_dist)
-      points.pop(closest_idx)
+      if editing_rect_idx == -1:
+        points.pop(closest_idx)
+      else:
+        if closest_idx is not None:
+          points[closest_idx] = (x, y)
     active_point = (x,y)
     render()
-  elif event == cv2.EVENT_LBUTTONUP:
+  # set the last point for a new rect
+  elif event == cv2.EVENT_LBUTTONUP and editing_rect_idx == -1:
     log.info("Up: %d,%d", x, y)
     active_point = None
     p = (x,y)
     if len(points) < 4:
       points.append(p)
     render()
+   
 
 cv2.setMouseCallback('image', canvas_click)
 
@@ -222,9 +302,9 @@ def do_crops():
     rotated = rotate(canvas, scaled_center, theta)
     cropped = cv2.getRectSubPix(rotated, scaled_size, scaled_center)
     #cv2.imshow('image', cropped)
-    cv2.imwrite(name, cropped, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+    cv2.imwrite(out_path + "/" + name, cropped, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
 
-file_idx = 1
+file_idx = 2
 
 def load_next():
   del points[:]
@@ -293,15 +373,20 @@ while 1:
     render()
   elif k == 32:
     # spacebar
-    if len(points) == 4:
-      rect = cv2.minAreaRect(np.int0(points))
-      center, size, theta = rect
-      log.info("center: %f,%f  -  size %f,%f  -  theta %f", center[0], center[1], size[0], size[1], theta)
-      rects.append(rect)
-      del points[:]
-      render()
+    if editing_rect_idx <= -1:
+      if len(points) == 4: 
+        rect = cv2.minAreaRect(np.int0(points))
+        center, size, theta = rect
+        log.info("center: %f,%f  -  size %f,%f  -  theta %f", center[0], center[1], size[0], size[1], theta)
+        rects.append(rect)
+        del points[:]
+        render()
+      else:
+        log.info("Can't finalize, only %d points set", len(points))
     else:
-      log.info("Can't finalize, only %d points set", len(points))
+      reset_selected_rect()
+      render()
+    
 
 log.info("DONE")
 cv2.destroyAllWindows()
